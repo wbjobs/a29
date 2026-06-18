@@ -1,15 +1,10 @@
-const Y = require('yjs');
-const { encoding, decoding } = require('lib0');
-const syncProtocol = require('y-protocols/sync');
-const awarenessProtocol = require('y-protocols/awareness');
-
+const { v4: uuidv4 } = require('uuid');
 const Scene = require('./models/Scene');
 const { getPublisher, getSubscriber } = require('./redis');
 
-const sceneDocs = new Map();
-const sceneAwareness = new Map();
+const scenes = new Map();
+const REDIS_OP_CHANNEL_PREFIX = 'scene-op:';
 const REDIS_SYNC_CHANNEL_PREFIX = 'scene-sync:';
-const REDIS_AWARENESS_CHANNEL_PREFIX = 'scene-awareness:';
 
 function createDefaultScene() {
   const rootId = 'root';
@@ -22,7 +17,8 @@ function createDefaultScene() {
     position: { x: 0, y: 0, z: 0 },
     rotation: { x: 0, y: 0, z: 0 },
     scale: { x: 1, y: 1, z: 1 },
-    visible: true
+    visible: true,
+    version: 0
   };
 
   const ambientId = 'default-ambient';
@@ -36,7 +32,8 @@ function createDefaultScene() {
     rotation: { x: 0, y: 0, z: 0 },
     scale: { x: 1, y: 1, z: 1 },
     light: { color: '#ffffff', intensity: 0.5 },
-    visible: true
+    visible: true,
+    version: 0
   };
 
   const dirId = 'default-directional';
@@ -50,7 +47,8 @@ function createDefaultScene() {
     rotation: { x: 0, y: 0, z: 0 },
     scale: { x: 1, y: 1, z: 1 },
     light: { color: '#ffffff', intensity: 1, castShadow: true },
-    visible: true
+    visible: true,
+    version: 0
   };
 
   const cameraId = 'default-camera';
@@ -64,7 +62,8 @@ function createDefaultScene() {
     rotation: { x: 0, y: 0, z: 0 },
     scale: { x: 1, y: 1, z: 1 },
     camera: { fov: 50, near: 0.1, far: 2000 },
-    visible: true
+    visible: true,
+    version: 0
   };
 
   root.children = [ambientId, dirId, cameraId];
@@ -75,167 +74,263 @@ function createDefaultScene() {
   nodes.set(dirId, directional);
   nodes.set(cameraId, camera);
 
-  return { rootNode: root, nodes };
+  return { rootId, rootNode: root, nodes, version: 0 };
 }
 
-function populateYDocFromScene(ydoc, sceneData) {
-  const yNodes = ydoc.getMap('nodes');
-  const yRootId = ydoc.getText('rootId');
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
 
-  if (yRootId.toString() === '') {
-    yRootId.insert(0, sceneData.rootNode.id);
+function applyOpToNode(node, op) {
+  if (op.path === 'position' || op.path === 'rotation' || op.path === 'scale') {
+    node[op.path] = { ...node[op.path], ...op.value };
+  } else if (op.path.startsWith('material.') || op.path.startsWith('light.') || op.path.startsWith('geometry.')) {
+    const [category, field] = op.path.split('.');
+    if (!node[category]) node[category] = {};
+    node[category][field] = op.value;
+  } else if (op.path === 'name' || op.path === 'visible') {
+    node[op.path] = op.value;
+  } else if (op.path === 'material') {
+    node.material = { ...node.material, ...op.value };
+  } else if (op.path === 'light') {
+    node.light = { ...node.light, ...op.value };
+  }
+  node.version = (node.version || 0) + 1;
+  return node;
+}
+
+function transformOp(op, concurrentOp) {
+  if (op.opId === concurrentOp.opId) return null;
+  if (op.nodeId !== concurrentOp.nodeId) return op;
+  if (op.type !== 'update' || concurrentOp.type !== 'update') return op;
+  if (op.path !== concurrentOp.path) return op;
+
+  if (op.timestamp < concurrentOp.timestamp ||
+      (op.timestamp === concurrentOp.timestamp && op.userId < concurrentOp.userId)) {
+    return op;
+  }
+  return null;
+}
+
+class SceneState {
+  constructor(sceneId) {
+    this.sceneId = sceneId;
+    this.nodes = new Map();
+    this.rootId = null;
+    this.version = 0;
+    this.opHistory = [];
+    this.connectedUsers = new Map();
   }
 
-  if (!yNodes.get(sceneData.rootNode.id)) {
-    yNodes.set(sceneData.rootNode.id, sceneData.rootNode);
-  }
-
-  sceneData.nodes.forEach((node, id) => {
-    if (!yNodes.get(id)) {
-      yNodes.set(id, node);
+  loadFromMongo(sceneDoc) {
+    if (sceneDoc.rootNode) {
+      this.rootId = sceneDoc.rootNode.id;
     }
-  });
-}
+    if (sceneDoc.nodes) {
+      if (sceneDoc.nodes instanceof Map) {
+        this.nodes = new Map(sceneDoc.nodes);
+      } else {
+        this.nodes = new Map();
+        Object.keys(sceneDoc.nodes).forEach((key) => {
+          this.nodes.set(key, sceneDoc.nodes[key]);
+        });
+      }
+    }
+    this.version = sceneDoc.version || 0;
+  }
 
-function sceneDocFromYDoc(ydoc) {
-  const yNodes = ydoc.getMap('nodes');
-  const rootId = ydoc.getText('rootId').toString();
-  const rootNode = yNodes.get(rootId);
+  getSceneData() {
+    const nodes = {};
+    this.nodes.forEach((node, id) => {
+      nodes[id] = node;
+    });
+    return {
+      rootId: this.rootId,
+      rootNode: this.nodes.get(this.rootId),
+      nodes,
+      version: this.version
+    };
+  }
 
-  const nodes = new Map();
-  yNodes.forEach((node, id) => {
-    nodes.set(id, node);
-  });
+  applyOperation(op) {
+    switch (op.type) {
+      case 'add':
+        return this.applyAddOp(op);
+      case 'remove':
+        return this.applyRemoveOp(op);
+      case 'update':
+        return this.applyUpdateOp(op);
+      default:
+        return false;
+    }
+  }
 
-  const yjsState = Y.encodeStateAsUpdate(ydoc);
-  return { rootNode, nodes, yjsState };
+  applyAddOp(op) {
+    if (this.nodes.has(op.node.id)) return false;
+    const node = deepClone(op.node);
+    node.version = 0;
+    this.nodes.set(node.id, node);
+
+    if (node.parentId && this.nodes.has(node.parentId)) {
+      const parent = this.nodes.get(node.parentId);
+      if (!parent.children.includes(node.id)) {
+        parent.children = [...(parent.children || []), node.id];
+        parent.version = (parent.version || 0) + 1;
+      }
+    }
+
+    this.version++;
+    this.opHistory.push(op);
+    if (this.opHistory.length > 1000) this.opHistory.shift();
+    return true;
+  }
+
+  applyRemoveOp(op) {
+    const node = this.nodes.get(op.nodeId);
+    if (!node) return false;
+
+    if (node.parentId && this.nodes.has(node.parentId)) {
+      const parent = this.nodes.get(node.parentId);
+      parent.children = (parent.children || []).filter((c) => c !== op.nodeId);
+      parent.version = (parent.version || 0) + 1;
+    }
+
+    const removeChildren = (children) => {
+      children.forEach((childId) => {
+        const child = this.nodes.get(childId);
+        if (child && child.children) removeChildren(child.children);
+        this.nodes.delete(childId);
+      });
+    };
+    if (node.children) removeChildren(node.children);
+
+    this.nodes.delete(op.nodeId);
+    this.version++;
+    this.opHistory.push(op);
+    if (this.opHistory.length > 1000) this.opHistory.shift();
+    return true;
+  }
+
+  applyUpdateOp(op) {
+    const node = this.nodes.get(op.nodeId);
+    if (!node) return false;
+    applyOpToNode(node, op);
+    this.version++;
+    this.opHistory.push(op);
+    if (this.opHistory.length > 1000) this.opHistory.shift();
+    return true;
+  }
+
+  addUser(socketId, userInfo) {
+    this.connectedUsers.set(socketId, userInfo);
+  }
+
+  removeUser(socketId) {
+    this.connectedUsers.delete(socketId);
+  }
+
+  getUsers() {
+    return Array.from(this.connectedUsers.values());
+  }
 }
 
 async function loadOrCreateScene(sceneId) {
-  if (sceneDocs.has(sceneId)) {
-    return sceneDocs.get(sceneId);
+  if (scenes.has(sceneId)) {
+    return scenes.get(sceneId);
   }
 
+  const sceneState = new SceneState(sceneId);
   let sceneDoc = await Scene.findOne({ sceneId });
-  const ydoc = new Y.Doc();
 
-  if (sceneDoc && sceneDoc.yjsState) {
-    try {
-      Y.applyUpdate(ydoc, sceneDoc.yjsState);
-      console.log(`Scene ${sceneId} loaded from MongoDB (Yjs state)`);
-    } catch (e) {
-      console.error('Failed to apply Yjs state, creating default:', e);
-      const defaultScene = createDefaultScene();
-      populateYDocFromScene(ydoc, defaultScene);
-    }
+  if (sceneDoc) {
+    sceneState.loadFromMongo(sceneDoc);
+    console.log(`Scene ${sceneId} loaded from MongoDB`);
   } else {
     const defaultScene = createDefaultScene();
-    populateYDocFromScene(ydoc, defaultScene);
+    sceneState.rootId = defaultScene.rootId;
+    sceneState.nodes = defaultScene.nodes;
+    sceneState.version = defaultScene.version;
 
-    const sceneData = sceneDocFromYDoc(ydoc);
+    const sceneData = sceneState.getSceneData();
     sceneDoc = new Scene({
       sceneId,
+      name: 'Untitled Scene',
       rootNode: sceneData.rootNode,
-      nodes: sceneData.nodes,
-      yjsState: sceneData.yjsState
+      nodes: sceneData.nodes
     });
     await sceneDoc.save();
     console.log(`Scene ${sceneId} created`);
   }
 
-  setupRedisSubscription(sceneId, ydoc);
-
-  ydoc.on('update', (update, origin) => {
-    if (origin !== 'redis') {
-      const publisher = getPublisher();
-      publisher.publish(REDIS_SYNC_CHANNEL_PREFIX + sceneId, JSON.stringify({
-        type: 'sync-update',
-        update: Array.from(update)
-      }));
-    }
-    scheduleSave(sceneId, ydoc);
-  });
-
-  sceneDocs.set(sceneId, ydoc);
-
-  const awareness = new awarenessProtocol.Awareness(ydoc);
-  awareness.on('update', ({ added, updated, removed }, origin) => {
-    if (origin !== 'redis') {
-      const states = [];
-      const changedClients = added.concat(updated).concat(removed);
-      const encoder = encoding.createEncoder();
-      awarenessProtocol.encodeAwarenessUpdate(awareness, changedClients, encoder);
-      const update = encoding.toUint8Array(encoder);
-      const publisher = getPublisher();
-      publisher.publish(REDIS_AWARENESS_CHANNEL_PREFIX + sceneId, JSON.stringify({
-        type: 'awareness-update',
-        update: Array.from(update)
-      }));
-    }
-  });
-  sceneAwareness.set(sceneId, awareness);
-
-  return ydoc;
+  setupRedisSubscription(sceneId, sceneState);
+  scenes.set(sceneId, sceneState);
+  return sceneState;
 }
 
-function getAwareness(sceneId) {
-  return sceneAwareness.get(sceneId);
-}
-
-function setupRedisSubscription(sceneId, ydoc) {
+function setupRedisSubscription(sceneId, sceneState) {
   const subscriber = getSubscriber();
-  const awareness = sceneAwareness.get(sceneId);
 
-  subscriber.subscribe(REDIS_SYNC_CHANNEL_PREFIX + sceneId, (err) => {
-    if (err) console.error('Redis subscribe error:', err);
-  });
-
-  subscriber.subscribe(REDIS_AWARENESS_CHANNEL_PREFIX + sceneId, (err) => {
+  subscriber.subscribe(REDIS_OP_CHANNEL_PREFIX + sceneId, (err) => {
     if (err) console.error('Redis subscribe error:', err);
   });
 
   subscriber.on('message', (channel, message) => {
+    if (channel !== REDIS_OP_CHANNEL_PREFIX + sceneId) return;
     try {
       const data = JSON.parse(message);
+      if (data.originServerId === getServerId()) return;
 
-      if (channel === REDIS_SYNC_CHANNEL_PREFIX + sceneId && data.type === 'sync-update') {
-        const update = new Uint8Array(data.update);
-        Y.applyUpdate(ydoc, update, 'redis');
-      }
-
-      if (channel === REDIS_AWARENESS_CHANNEL_PREFIX + sceneId && data.type === 'awareness-update') {
-        const update = new Uint8Array(data.update);
-        if (awareness) {
-          const decoder = decoding.createDecoder(update);
-          awarenessProtocol.applyAwarenessUpdate(awareness, decoder, 'redis');
-        }
+      const applied = sceneState.applyOperation(data.op);
+      if (applied) {
+        scheduleSave(sceneId);
       }
     } catch (e) {
-      console.error('Redis message parse error:', e);
+      console.error('Redis op parse error:', e);
     }
   });
 }
 
+let serverId = null;
+function getServerId() {
+  if (!serverId) {
+    serverId = uuidv4();
+  }
+  return serverId;
+}
+
+function broadcastOp(sceneId, op, originSocketId, io) {
+  const publisher = getPublisher();
+  publisher.publish(REDIS_OP_CHANNEL_PREFIX + sceneId, JSON.stringify({
+    op,
+    originServerId: getServerId()
+  }));
+
+  if (io && originSocketId) {
+    io.to(sceneId).except(originSocketId).emit('operation', op);
+  }
+}
+
 const saveTimers = new Map();
-function scheduleSave(sceneId, ydoc) {
+function scheduleSave(sceneId) {
   if (saveTimers.has(sceneId)) {
     clearTimeout(saveTimers.get(sceneId));
   }
   saveTimers.set(sceneId, setTimeout(() => {
-    saveSceneToMongoDB(sceneId, ydoc);
+    saveSceneToMongoDB(sceneId);
     saveTimers.delete(sceneId);
   }, 5000));
 }
 
-async function saveSceneToMongoDB(sceneId, ydoc) {
+async function saveSceneToMongoDB(sceneId) {
   try {
-    const sceneData = sceneDocFromYDoc(ydoc);
+    const sceneState = scenes.get(sceneId);
+    if (!sceneState) return;
+    const sceneData = sceneState.getSceneData();
     await Scene.findOneAndUpdate(
       { sceneId },
       {
         rootNode: sceneData.rootNode,
         nodes: sceneData.nodes,
-        yjsState: sceneData.yjsState,
         updatedAt: new Date()
       },
       { upsert: true, new: true }
@@ -248,6 +343,8 @@ async function saveSceneToMongoDB(sceneId, ydoc) {
 
 module.exports = {
   loadOrCreateScene,
-  getAwareness,
-  saveSceneToMongoDB
+  broadcastOp,
+  saveSceneToMongoDB,
+  transformOp,
+  deepClone
 };

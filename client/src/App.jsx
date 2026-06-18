@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { v4 as uuidv4 } from 'uuid';
 import { createCollaboration } from './collaboration.js';
 import { SceneManager } from './SceneManager.js';
 import './styles.css';
@@ -18,21 +17,55 @@ export default function App() {
   const [isJoined, setIsJoined] = useState(false);
   const [sceneId, setSceneId] = useState(DEFAULT_SCENE_ID);
   const [transformMode, setTransformMode] = useState('translate');
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
+  const updateNodesList = useCallback(() => {
+    if (!collabRef.current) return;
+    const nodeList = collabRef.current.getNodesArray();
+    setNodes(nodeList);
+  }, []);
+
+  const updateUsers = useCallback(() => {
+    if (!collabRef.current) return;
+    setUsers([...collabRef.current.users]);
+  }, []);
+
+  const updateHistoryState = useCallback(() => {
+    if (!sceneManagerRef.current) return;
+    setCanUndo(sceneManagerRef.current.canUndo());
+    setCanRedo(sceneManagerRef.current.canRedo());
+  }, []);
 
   const handleSceneChange = useCallback((event) => {
     if (event.type === 'select') {
       setSelectedId(event.id);
       if (event.id && collabRef.current) {
-        const node = collabRef.current.yNodes.get(event.id);
+        const node = collabRef.current.getNode(event.id);
         setSelectedNode(node);
       } else {
         setSelectedNode(null);
       }
     }
-    if (event.type === 'delete' && event.id && collabRef.current) {
-      sceneManagerRef.current?.deleteNode(event.id);
+    if (event.type === 'scene-change') {
+      updateNodesList();
+      updateUsers();
+      updateHistoryState();
+      if (selectedId && collabRef.current?.hasNode(selectedId)) {
+        setSelectedNode(collabRef.current.getNode(selectedId));
+      } else if (selectedId) {
+        setSelectedId(null);
+        setSelectedNode(null);
+      }
     }
-  }, []);
+    if (event.type === 'undo' || event.type === 'redo') {
+      updateHistoryState();
+      updateNodesList();
+      if (selectedId && collabRef.current?.hasNode(selectedId)) {
+        setSelectedNode(collabRef.current.getNode(selectedId));
+      }
+    }
+  }, [selectedId, updateNodesList, updateUsers, updateHistoryState]);
 
   const joinScene = useCallback(() => {
     if (!containerRef.current || isJoined) return;
@@ -40,42 +73,28 @@ export default function App() {
     const collab = createCollaboration(sceneId, userName);
     collabRef.current = collab;
 
-    const sm = new SceneManager(containerRef.current, collab.yNodes, collab.yRootId, handleSceneChange);
+    const sm = new SceneManager(containerRef.current, collab, handleSceneChange);
     sceneManagerRef.current = sm;
 
-    const updateNodesList = () => {
-      const nodeList = [];
-      collab.yNodes.forEach((node) => {
-        nodeList.push(node);
-      });
-      setNodes(nodeList);
-    };
-
-    const updateUsers = () => {
-      const userList = [];
-      collab.awareness.getStates().forEach((state, clientId) => {
-        if (state && state.user) {
-          userList.push({ clientId, ...state.user });
-        }
-      });
-      setUsers(userList);
-    };
-
-    collab.yNodes.observeDeep(() => {
-      sm.syncFromYjs();
-      updateNodesList();
-      if (selectedId && collab.yNodes.has(selectedId)) {
-        setSelectedNode(collab.yNodes.get(selectedId));
-      }
-    });
-
-    collab.awareness.on('change', updateUsers);
     updateNodesList();
     updateUsers();
     setIsJoined(true);
 
-    setTimeout(() => sm.syncFromYjs(), 200);
-  }, [sceneId, userName, isJoined, handleSceneChange, selectedId]);
+    const refreshAll = () => {
+      updateNodesList();
+      updateUsers();
+      updateHistoryState();
+      if (selectedId && collab.hasNode(selectedId)) {
+        setSelectedNode(collab.getNode(selectedId));
+      }
+    };
+
+    collab.subscribe(() => {
+      refreshAll();
+    });
+
+    setTimeout(refreshAll, 300);
+  }, [sceneId, userName, isJoined, handleSceneChange, selectedId, updateNodesList, updateUsers, updateHistoryState]);
 
   useEffect(() => {
     return () => {
@@ -97,7 +116,7 @@ export default function App() {
       sphere: { radius: 0.5, widthSegments: 32, heightSegments: 32 },
       plane: { width: 2, height: 2 }
     };
-    sceneManagerRef.current.addNode({
+    const newId = sceneManagerRef.current.addNode({
       type: 'mesh',
       name: type.charAt(0).toUpperCase() + type.slice(1),
       position: {
@@ -112,6 +131,9 @@ export default function App() {
         opacity: 1
       }
     });
+    setSelectedId(newId);
+    updateHistoryState();
+    updateNodesList();
   };
 
   const addLight = (type) => {
@@ -126,22 +148,42 @@ export default function App() {
       pointLight: { x: 2, y: 3, z: 2 },
       directionalLight: { x: 5, y: 10, z: 7.5 }
     };
-    sceneManagerRef.current.addNode({
+    const newId = sceneManagerRef.current.addNode({
       type,
       name: type.replace('Light', ' Light'),
       position: posDefaults[type],
       light: lightDefaults[type]
     });
+    setSelectedId(newId);
+    updateHistoryState();
+    updateNodesList();
   };
 
   const updateSelectedNode = (updates) => {
     if (!selectedId || !sceneManagerRef.current) return;
     sceneManagerRef.current.updateNode(selectedId, updates);
+    updateHistoryState();
+    updateNodesList();
+    if (collabRef.current?.hasNode(selectedId)) {
+      setSelectedNode(collabRef.current.getNode(selectedId));
+    }
   };
 
   const deleteSelected = () => {
     if (!selectedId || !sceneManagerRef.current) return;
     sceneManagerRef.current.deleteNode(selectedId);
+    setSelectedId(null);
+    setSelectedNode(null);
+    updateHistoryState();
+    updateNodesList();
+  };
+
+  const handleUndo = () => {
+    sceneManagerRef.current?.undo();
+  };
+
+  const handleRedo = () => {
+    sceneManagerRef.current?.redo();
   };
 
   if (!isJoined) {
@@ -149,7 +191,7 @@ export default function App() {
       <div className="login-screen">
         <div className="login-box">
           <h1 className="title">3D Scene Editor</h1>
-          <p className="subtitle">Collaborative Real-Time Editing</p>
+          <p className="subtitle">Collaborative Real-Time Editing with OT</p>
           <div className="form-group">
             <label>Scene ID</label>
             <input
@@ -204,10 +246,10 @@ export default function App() {
         </div>
 
         <div className="panel">
-          <h3 className="panel-title">Online Users</h3>
+          <h3 className="panel-title">Online Users ({users.length})</h3>
           <div className="user-list">
             {users.map((user) => (
-              <div key={user.clientId} className="user-item">
+              <div key={user.id} className="user-item">
                 <span className="user-dot" style={{ backgroundColor: user.color }} />
                 <span>{user.name}</span>
               </div>
@@ -219,17 +261,45 @@ export default function App() {
       <div className="main-area">
         <div className="toolbar">
           <div className="toolbar-group">
+            <span className="toolbar-label">Edit:</span>
+            <button
+              className={`btn ${canUndo ? '' : 'disabled'}`}
+              onClick={handleUndo}
+              disabled={!canUndo}
+              title="Undo (Ctrl+Z)"
+            >
+              ↶ Undo
+            </button>
+            <button
+              className={`btn ${canRedo ? '' : 'disabled'}`}
+              onClick={handleRedo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Shift+Z / Ctrl+Y)"
+            >
+              ↷ Redo
+            </button>
+          </div>
+
+          <div className="toolbar-divider" />
+
+          <div className="toolbar-group">
             <span className="toolbar-label">Add Geometry:</span>
             <button className="btn" onClick={() => addGeometry('box')}>Cube</button>
             <button className="btn" onClick={() => addGeometry('sphere')}>Sphere</button>
             <button className="btn" onClick={() => addGeometry('plane')}>Plane</button>
           </div>
+
+          <div className="toolbar-divider" />
+
           <div className="toolbar-group">
             <span className="toolbar-label">Add Light:</span>
             <button className="btn" onClick={() => addLight('ambientLight')}>Ambient</button>
             <button className="btn" onClick={() => addLight('pointLight')}>Point</button>
             <button className="btn" onClick={() => addLight('directionalLight')}>Directional</button>
           </div>
+
+          <div className="toolbar-divider" />
+
           <div className="toolbar-group">
             <span className="toolbar-label">Transform:</span>
             <button
@@ -251,13 +321,18 @@ export default function App() {
               Scale (E)
             </button>
           </div>
+
           {selectedId && (
-            <div className="toolbar-group">
-              <button className="btn btn-danger" onClick={deleteSelected}>
-                Delete (Del)
-              </button>
-            </div>
+            <>
+              <div className="toolbar-divider" />
+              <div className="toolbar-group">
+                <button className="btn btn-danger" onClick={deleteSelected}>
+                  Delete (Del)
+                </button>
+              </div>
+            </>
           )}
+
           <div className="toolbar-spacer" />
           <div className="toolbar-group">
             <span className="scene-info">Scene: {sceneId}</span>
@@ -267,7 +342,11 @@ export default function App() {
         <div className="viewport" ref={containerRef} />
 
         <div className="statusbar">
-          <span>Tip: Click objects to select. Q=Move, W=Rotate, E=Scale, Del=Delete, Esc=Deselect</span>
+          <span>
+            Tips: Click objects to select. Q=Move, W=Rotate, E=Scale, Del=Delete, Esc=Deselect
+            &nbsp;&nbsp;|&nbsp;&nbsp;
+            Ctrl+Z=Undo, Ctrl+Shift+Z / Ctrl+Y=Redo
+          </span>
         </div>
       </div>
 

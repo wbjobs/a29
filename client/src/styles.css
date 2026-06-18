@@ -114,6 +114,13 @@ body {
   color: white;
 }
 
+.btn:disabled,
+.btn.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -270,6 +277,13 @@ body {
   color: var(--text-secondary);
   margin-right: 4px;
   font-weight: 500;
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 24px;
+  background: var(--border-color);
+  margin: 0 4px;
 }
 
 .toolbar-spacer {

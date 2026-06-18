@@ -4,13 +4,10 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const Y = require('yjs');
-const { encoding, decoding } = require('lib0');
-const syncProtocol = require('y-protocols/sync');
-const awarenessProtocol = require('y-protocols/awareness');
+const { v4: uuidv4 } = require('uuid');
 
 const { connectMongoDB } = require('./mongo');
-const { loadOrCreateScene, getAwareness } = require('./sceneManager');
+const { loadOrCreateScene, broadcastOp, transformOp, deepClone } = require('./sceneManager');
 
 const app = express();
 app.use(cors());
@@ -31,127 +28,89 @@ app.get('/health', (req, res) => {
 app.get('/api/scenes/:sceneId', async (req, res) => {
   try {
     const { sceneId } = req.params;
-    const ydoc = await loadOrCreateScene(sceneId);
-    const yNodes = ydoc.getMap('nodes');
-    const rootId = ydoc.getText('rootId').toString();
-    const rootNode = yNodes.get(rootId);
-    const nodes = {};
-    yNodes.forEach((val, key) => {
-      nodes[key] = val;
-    });
-    res.json({ sceneId, rootNode, nodes });
+    const sceneState = await loadOrCreateScene(sceneId);
+    res.json(sceneState.getSceneData());
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-const messageSync = 0;
-const messageAwareness = 1;
-const messageQueryAwareness = 3;
-
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
   socket.on('join-scene', async ({ sceneId, userId, userName }) => {
-    socket.join(sceneId);
-    socket.data.sceneId = sceneId;
-    socket.data.userId = userId;
-    socket.data.userName = userName || 'Anonymous';
+    try {
+      socket.join(sceneId);
+      socket.data.sceneId = sceneId;
+      socket.data.userId = userId;
+      socket.data.userName = userName || 'Anonymous';
 
-    const ydoc = await loadOrCreateScene(sceneId);
-    const awareness = getAwareness(sceneId);
+      const sceneState = await loadOrCreateScene(sceneId);
 
-    awareness.setLocalStateField('user', {
-      id: userId,
-      name: userName || 'Anonymous',
-      color: getRandomColor()
-    });
+      const userInfo = {
+        id: userId,
+        name: userName || 'Anonymous',
+        color: getRandomColor(),
+        socketId: socket.id
+      };
+      sceneState.addUser(socket.id, userInfo);
 
-    socket.on('message', (encoder) => {
-      const decoder = decoding.createDecoder(encoder);
-      const encoder2 = encoding.createEncoder();
-      const messageType = decoding.readVarUint(decoder);
+      socket.emit('scene-state', sceneState.getSceneData());
+      io.to(sceneId).emit('user-joined', userInfo);
+      io.to(sceneId).emit('users-list', sceneState.getUsers());
 
-      switch (messageType) {
-        case messageSync: {
-          encoding.writeVarUint(encoder2, messageSync);
-          syncProtocol.readSyncMessage(decoder, encoder2, ydoc, socket.id);
-          if (encoding.length(encoder2) > 1) {
-            socket.send(encoding.toUint8Array(encoder2));
-          }
-          broadcastToRoomExceptSender(sceneId, socket.id, messageSync, encoder2, ydoc);
-          break;
-        }
-        case messageAwareness: {
-          awarenessProtocol.applyAwarenessUpdate(
-            awareness,
-            decoding.readVarUint8Array(decoder),
-            socket
-          );
-          break;
-        }
-        case messageQueryAwareness: {
-          const users = [];
-          awareness.getStates().forEach((state, clientId) => {
-            if (state && state.user) {
-              users.push({ clientId, ...state.user });
-            }
-          });
-          socket.emit('users-list', users);
-          break;
-        }
+      console.log(`User ${userName} (${userId}) joined scene ${sceneId}`);
+    } catch (err) {
+      console.error('join-scene error:', err);
+    }
+  });
+
+  socket.on('operation', (op) => {
+    const sceneId = socket.data.sceneId;
+    if (!sceneId) return;
+
+    loadOrCreateScene(sceneId).then((sceneState) => {
+      op.opId = op.opId || uuidv4();
+      op.userId = socket.data.userId;
+      op.timestamp = op.timestamp || Date.now();
+
+      const applied = sceneState.applyOperation(op);
+      if (applied) {
+        broadcastOp(sceneId, op, socket.id, io);
       }
     });
+  });
 
-    awareness.on('change', () => {
-      const users = [];
-      awareness.getStates().forEach((state, clientId) => {
-        if (state && state.user) {
-          users.push({ clientId, ...state.user });
-        }
-      });
-      io.to(sceneId).emit('users-list', users);
+  socket.on('undo', ({ opId }) => {
+    console.log('Undo operation not fully implemented on server, handled by clients');
+  });
+
+  socket.on('redo', ({ opId }) => {
+    console.log('Redo operation not fully implemented on server, handled by clients');
+  });
+
+  socket.on('request-users', () => {
+    const sceneId = socket.data.sceneId;
+    if (!sceneId) return;
+    loadOrCreateScene(sceneId).then((sceneState) => {
+      socket.emit('users-list', sceneState.getUsers());
     });
-
-    const encoder = encoding.createEncoder();
-    encoding.writeVarUint(encoder, messageSync);
-    syncProtocol.writeSyncStep1(encoder, ydoc);
-    socket.send(encoding.toUint8Array(encoder));
-
-    console.log(`User ${socket.data.userName} (${userId}) joined scene ${sceneId}`);
-    io.to(sceneId).emit('user-joined', { userId, userName: socket.data.userName, socketId: socket.id });
   });
 
   socket.on('disconnect', () => {
     const sceneId = socket.data.sceneId;
     const userId = socket.data.userId;
     if (sceneId) {
-      const awareness = getAwareness(sceneId);
-      if (awareness) {
-        awarenessProtocol.removeAwarenessStates(
-          awareness,
-          Array.from(awareness.getStates().keys()).filter(
-            (clientId) => awareness.getStates().get(clientId)?.user?.id === userId
-          ),
-          socket
-        );
-      }
-      io.to(sceneId).emit('user-left', { userId, socketId: socket.id });
-      console.log(`User ${userId} disconnected from scene ${sceneId}`);
+      loadOrCreateScene(sceneId).then((sceneState) => {
+        sceneState.removeUser(socket.id);
+        io.to(sceneId).emit('user-left', { userId, socketId: socket.id });
+        io.to(sceneId).emit('users-list', sceneState.getUsers());
+        console.log(`User ${userId} disconnected from scene ${sceneId}`);
+      });
     }
   });
 });
-
-function broadcastToRoomExceptSender(sceneId, senderSocketId, messageType, encoder, ydoc) {
-  if (encoding.length(encoder) <= 1) return;
-  const data = encoding.toUint8Array(encoder);
-  io.to(sceneId).sockets.forEach((socket) => {
-    if (socket.id !== senderSocketId) {
-      socket.send(data);
-    }
-  });
-}
 
 function getRandomColor() {
   const colors = [
