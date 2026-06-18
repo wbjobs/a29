@@ -120,6 +120,7 @@ class SceneState {
     this.version = 0;
     this.opHistory = [];
     this.connectedUsers = new Map();
+    this.currentBranch = 'main';
   }
 
   loadFromMongo(sceneDoc) {
@@ -137,6 +138,7 @@ class SceneState {
       }
     }
     this.version = sceneDoc.version || 0;
+    this.currentBranch = sceneDoc.currentBranch || 'main';
   }
 
   getSceneData() {

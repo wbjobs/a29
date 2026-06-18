@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createCollaboration } from './collaboration.js';
 import { SceneManager } from './SceneManager.js';
+import VersionPanel from './components/VersionPanel.jsx';
+import AIPanel from './components/AIPanel.jsx';
+import ARPanel from './components/ARPanel.jsx';
 import './styles.css';
 
 const DEFAULT_SCENE_ID = 'demo-scene';
@@ -19,6 +22,9 @@ export default function App() {
   const [transformMode, setTransformMode] = useState('translate');
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
+  const [showVersionPanel, setShowVersionPanel] = useState(false);
+  const [showAIPanel, setShowAIPanel] = useState(false);
+  const [showARPanel, setShowARPanel] = useState(false);
 
   const updateNodesList = useCallback(() => {
     if (!collabRef.current) return;
@@ -159,6 +165,16 @@ export default function App() {
     updateNodesList();
   };
 
+  const handleAddAIGroup = useCallback((groupData, childrenData) => {
+    if (!sceneManagerRef.current) return;
+    const newId = sceneManagerRef.current.addAIGeneratedGroup(groupData, childrenData);
+    if (newId) {
+      setSelectedId(newId);
+      updateHistoryState();
+      updateNodesList();
+    }
+  }, [updateHistoryState, updateNodesList]);
+
   const updateSelectedNode = (updates) => {
     if (!selectedId || !sceneManagerRef.current) return;
     sceneManagerRef.current.updateNode(selectedId, updates);
@@ -260,6 +276,33 @@ export default function App() {
 
       <div className="main-area">
         <div className="toolbar">
+          <div className="toolbar-group">
+            <span className="toolbar-label">Pro:</span>
+            <button
+              className="btn"
+              onClick={() => setShowVersionPanel(true)}
+              title="Version Control (Git-like)"
+            >
+              📦 Versions
+            </button>
+            <button
+              className="btn"
+              onClick={() => setShowAIPanel(true)}
+              title="AI Model Generator"
+            >
+              🤖 AI Gen
+            </button>
+            <button
+              className="btn"
+              onClick={() => setShowARPanel(true)}
+              title="AR Preview Mode"
+            >
+              📱 AR
+            </button>
+          </div>
+
+          <div className="toolbar-divider" />
+
           <div className="toolbar-group">
             <span className="toolbar-label">Edit:</span>
             <button
@@ -669,6 +712,28 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {showVersionPanel && (
+        <VersionPanel
+          userId={collabRef.current?.userId}
+          userName={collabRef.current?.userName || userName}
+          onClose={() => setShowVersionPanel(false)}
+        />
+      )}
+
+      {showAIPanel && (
+        <AIPanel
+          onAddObject={handleAddAIGroup}
+          onClose={() => setShowAIPanel(false)}
+        />
+      )}
+
+      {showARPanel && (
+        <ARPanel
+          collab={collabRef.current}
+          onClose={() => setShowARPanel(false)}
+        />
+      )}
     </div>
   );
 }

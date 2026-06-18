@@ -8,6 +8,20 @@ const { v4: uuidv4 } = require('uuid');
 
 const { connectMongoDB } = require('./mongo');
 const { loadOrCreateScene, broadcastOp, transformOp, deepClone } = require('./sceneManager');
+const {
+  commitScene,
+  listCommits,
+  listAllCommits,
+  getCommit,
+  checkoutCommit,
+  createBranch,
+  listBranches,
+  switchBranch,
+  detectConflicts,
+  mergeBranch,
+  deleteBranch
+} = require('./versionControl');
+const { generate3DObject, validateCode, sanitizeCode } = require('./aiModeler');
 
 const app = express();
 app.use(cors());
@@ -30,6 +44,179 @@ app.get('/api/scenes/:sceneId', async (req, res) => {
     const { sceneId } = req.params;
     const sceneState = await loadOrCreateScene(sceneId);
     res.json(sceneState.getSceneData());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== Version Control API ====================
+
+app.post('/api/scenes/:sceneId/commits', async (req, res) => {
+  try {
+    const { sceneId } = req.params;
+    const { message, userId, userName } = req.body;
+    const sceneState = await loadOrCreateScene(sceneId);
+    const result = await commitScene(sceneState, { userId, userName }, message);
+    io.to(sceneId).emit('version-committed', result);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/scenes/:sceneId/commits', async (req, res) => {
+  try {
+    const { sceneId } = req.params;
+    const { branch, limit } = req.query;
+    const commits = await listCommits(sceneId, branch, parseInt(limit) || 50);
+    res.json(commits);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/scenes/:sceneId/commits/:commitId', async (req, res) => {
+  try {
+    const { sceneId, commitId } = req.params;
+    const commit = await getCommit(sceneId, commitId);
+    if (!commit) {
+      return res.status(404).json({ error: 'Commit not found' });
+    }
+    delete commit.snapshot;
+    res.json(commit);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/scenes/:sceneId/commits/:commitId/checkout', async (req, res) => {
+  try {
+    const { sceneId, commitId } = req.params;
+    const sceneState = await loadOrCreateScene(sceneId);
+    const sceneData = await checkoutCommit(sceneState, commitId);
+    io.to(sceneId).emit('scene-state', sceneData);
+    io.to(sceneId).emit('version-checked-out', { commitId });
+    res.json({ success: true, commitId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/scenes/:sceneId/branches', async (req, res) => {
+  try {
+    const { sceneId } = req.params;
+    const branches = await listBranches(sceneId);
+    res.json(branches);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/scenes/:sceneId/branches', async (req, res) => {
+  try {
+    const { sceneId } = req.params;
+    const { branchName, fromCommitId } = req.body;
+    const branch = await createBranch(sceneId, branchName, fromCommitId);
+    res.json(branch);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/scenes/:sceneId/branches/:branchName/switch', async (req, res) => {
+  try {
+    const { sceneId, branchName } = req.params;
+    const sceneState = await loadOrCreateScene(sceneId);
+    await switchBranch(sceneState, branchName);
+    const sceneData = sceneState.getSceneData();
+    io.to(sceneId).emit('scene-state', sceneData);
+    io.to(sceneId).emit('branch-switched', { branchName });
+    res.json({ success: true, branchName, sceneData });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/scenes/:sceneId/branches/:sourceBranch/merge/:targetBranch/conflicts', async (req, res) => {
+  try {
+    const { sceneId, sourceBranch, targetBranch } = req.params;
+    const conflicts = await detectConflicts(sceneId, sourceBranch, targetBranch);
+    res.json(conflicts);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/scenes/:sceneId/branches/:sourceBranch/merge/:targetBranch', async (req, res) => {
+  try {
+    const { sceneId, sourceBranch, targetBranch } = req.params;
+    const { resolutionStrategy, manualResolutions } = req.body;
+    const sceneState = await loadOrCreateScene(sceneId);
+    const result = await mergeBranch(sceneState, sourceBranch, targetBranch, resolutionStrategy, manualResolutions);
+    if (result.success) {
+      const sceneData = sceneState.getSceneData();
+      io.to(sceneId).emit('scene-state', sceneData);
+      io.to(sceneId).emit('branches-merged', { sourceBranch, targetBranch, result });
+    }
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/scenes/:sceneId/branches/:branchName', async (req, res) => {
+  try {
+    const { sceneId, branchName } = req.params;
+    await deleteBranch(sceneId, branchName);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== AI Modeler API ====================
+
+app.post('/api/ai/generate', async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt || prompt.trim().length === 0) {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+    const result = await generate3DObject(prompt);
+    if (result.success) {
+      const code = sanitizeCode(result.code);
+      const valid = validateCode(code);
+      res.json({
+        success: true,
+        code,
+        valid,
+        model: result.model
+      });
+    } else {
+      res.status(500).json(result);
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/ai/validate', async (req, res) => {
+  try {
+    const { code } = req.body;
+    const valid = validateCode(code);
+    res.json({ valid });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });

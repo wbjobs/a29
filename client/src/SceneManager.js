@@ -612,6 +612,27 @@ export class SceneManager {
     this.renderer.render(this.scene, this.camera);
   };
 
+  addAIGeneratedGroup(groupData, childrenData) {
+    if (!groupData) return;
+
+    this.suppressUpdates = true;
+    const groupId = this.collab.addNode(groupData, true);
+
+    if (childrenData && Array.isArray(childrenData)) {
+      childrenData.forEach((child) => {
+        this.collab.addNode(child, false);
+      });
+    }
+
+    this.suppressUpdates = false;
+    this.syncFromCollab();
+
+    if (groupId) {
+      this.selectObject(groupId);
+    }
+    return groupId;
+  }
+
   dispose() {
     this.unsubscribeCollab && this.unsubscribeCollab();
     this.renderer.domElement.removeEventListener('pointerdown', this.onMouseDown);
